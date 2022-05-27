@@ -1,0 +1,19 @@
+{
+  "name": "augmented-rpc",
+  "version": "1.0.0",
+  "description": "Middleware for EVM RPCs",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "git@d10r.net",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^0.25.0",
+    "body-parser": "^1.19.1",
+    "express": "^4.17.2",
+    "socket.io": "^4.5.0",
+    "socket.io-client": "^4.5.0",
+    "ws": "^8.5.0"
+  }
+}

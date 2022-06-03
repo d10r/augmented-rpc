@@ -50,8 +50,10 @@ let socket; // socket.io
 // value type: { ts, val, readCnt, writeCnt } where `ts` is a timestamp (int) and val the cached value (whatever was returned)
 const cache = new Map();
 
-// print some stats on shutdonw (Ctrl-C)
-process.on("SIGINT", () => {
+// print some stats on shutdown (e.g. Ctrl-C)
+process.on("SIGINT", printStats);
+
+function printStats() {
     console.log("stats:");
     console.log(`nr http requests processed: ${httpReqCnt}`);
     console.log(`nr http upstream responses: ${httpUpstreamResCnt}`);
@@ -63,7 +65,7 @@ process.on("SIGINT", () => {
         console.log(`key ${key}: ${value.readCnt} reads, ${value.writeCnt} writes`);
     }
     process.exit();
-});
+}
 
 function getCacheKey(req) {
     return `${req.body.method}${JSON.stringify(req.body.params)}`;
@@ -122,6 +124,8 @@ async function handleHttpConnection(rpcUrl) {
     app.listen(port, () => {
         console.log(`listening on port ${port}`);
     });
+    
+    app.get("/printstats", printStats);
     
     app.post("/", async (req, res) => {
         console.log(`RPC request at ${Date.now()/1000}: ${JSON.stringify(req.body)}`);

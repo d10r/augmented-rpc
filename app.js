@@ -1,33 +1,22 @@
-/*
- * Middleware for RPC requests which logs requests and answer, may do more in the future.
- * Usage: RPC=<http-url|ws-url> [PORT=<port>] <exe> 
- * 
- * If an http url is given, an http server is started.
- * If a websocket url is given, a websocket server is started.
- * 
- * The following additional functionality is implemented for http upstreams:
- * 
- * Responses are cached. For requests with unchanging response data (e.g. eth_chainId), it always serves the cached response.  
- * For some request (e.g. eth_blockNumber), it serves cached responses only for a given time in order to avoid rate limiting.
- * Can be set with env var CACHE_MAX_AGE (seconds).
- * 
- * If further tries to detect duplicate requests and slows them down in order to increase the chance of a cache hit.
- * That is, if the same request is received multiple times in short succession, all but the first one are briefly delayed.
- * 
- * Together this can greatly reduce the requests forwarded to upstream, increasing the chances of not running into rate limits.
- * 
- * If an upstream error occurs anyway, it will retry several times with exponential backoff. Only if the failure is permanent will the error propagate to the client.
- *
- * When the process ends, a brief summary of cached vs forwarded requests is printed.
- */
-
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
+const sqlite3 = require('sqlite3').verbose();
 
 if (!process.env.RPC) {
     throw Error("env var RPC not set");
 }
+
+const db = process.env.DB_FILE !== undefined ?
+    new sqlite3.Database(process.env.DB_FILE, (err) => {
+        if (err) throw Error(`opening DB at ${process.env.DB_FILE} failed: ${err.message}`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS data(key TEXT PRIMARY KEY, val TEXT, ts INTEGER)`, (err) => {
+            if (err) throw Error(`create table failed: ${err.message}`);
+        });
+        console.log(`opened and initialized DB ${process.env.DB_FILE}`);
+    }) :
+    undefined;
 
 const port = process.env.PORT || 3000;
 const rpc = process.env.RPC;
@@ -51,7 +40,7 @@ let socket; // socket.io
 const cache = new Map();
 
 // print some stats on shutdown (e.g. Ctrl-C)
-process.on("SIGINT", printStats);
+process.on("SIGINT", printStatsAndExit);
 
 function printStats() {
     console.log("stats:");
@@ -59,11 +48,23 @@ function printStats() {
     console.log(`nr http upstream responses: ${httpUpstreamResCnt}`);
     console.log(`nr http cached responses: ${httpCacheResCnt}`);
     
-    console.log("cache stats:");
-    for (const key of cache.keys()) {
-        value = cache.get(key);
-        console.log(`key ${key}: ${value.readCnt} reads, ${value.writeCnt} writes`);
+    if (db !== undefined) {
+        console.log("DB cache stats:");
+        db.get(`SELECT COUNT(*) as count FROM data`, (err, row) => {
+            if (err) throw err;
+            console.log(`DB contains ${row.count} entries`);
+        });
+    } else {
+        console.log("in-memory cache stats:");
+        for (const key of cache.keys()) {
+            value = cache.get(key);
+            console.log(`key ${key}: ${value.readCnt} reads, ${value.writeCnt} writes`);
+        }
     }
+}
+
+function printStatsAndExit() {
+    printStats();
     process.exit();
 }
 
@@ -77,20 +78,34 @@ function getCacheKey(req) {
 // param maxAgeMs: maximum age the cached entry may have to be considered. Can be `Infinity`
 // param reqId: json-rpc id. Is just passed through
 function getResponseFromCache(key, maxAgeMs, reqId) {
-    if (cache.has(key)) {
+    let val;
+    if (cache.has(key)) { // try from cache
         if (Date.now() - cache.get(key).ts <= maxAgeMs) {
-            cacheRes = {
-                jsonrpc: "2.0",
-                id: reqId,
-                result: cache.get(key).val
-            }
+            val = cache.get(key).val;
+            // increment counter
             cache.set(key, { ...cache.get(key), readCnt: cache.get(key).readCnt+1 });
-            return cacheRes;
         } else {
             console.debug(`cached entry skipped, too old (> ${maxAgeMs} ms)`);
         }
+    } else if (db !== undefined) { // try from DB
+        db.get(`SELECT val FROM data WHERE key = ?`, [key], function(err, row) {
+            if (err) console.error(`DB read error: ${err.message}`);
+            // If the key doesn't exist, row will be undefined
+            if (row) {
+                console.log(`DB: Retrieved key ${key}, value ${row.val}`);
+                // We expect the stored value to be a JSON string, so parse it before returning.
+                val = row.val;
+            }
+        });
     }
-    return undefined;
+
+    return val === undefined ?
+        undefined :
+        {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: cache.get(key).val
+        };
 }
 
 function writeResponseToCache(key, val) {
@@ -101,7 +116,14 @@ function writeResponseToCache(key, val) {
         writeCnt: cache.has(key) ? cache.get(key).writeCnt+1 : 1
     };
     console.debug(`writing to cache: key ${key}, value ${JSON.stringify(newValue)}`);
-    cache.set(key, newValue);
+
+    if (db !== undefined) {
+        db.run(`INSERT OR REPLACE INTO data(key, val, ts) VALUES(?, ?, ?)`, [key, JSON.stringify(newValue.val), newValue.ts], function(err) {
+            if (err) return console.error(err.message);
+        });
+    } else {
+        cache.set(key, newValue);
+    }
 }
 
 // ********************************************************
@@ -145,7 +167,7 @@ async function handleHttpConnection(rpcUrl) {
         duplicateDetector.set(cacheKey, Date.now());
         
         // Check if we can reuse a cached response
-        const cacheMaxAgeMs = ["eth_chainId", "net_version"].includes(req.body.method) ? Infinity : CACHE_MAX_AGE*1000;
+        const cacheMaxAgeMs = ["eth_chainId", "net_version", "eth_getTransactionReceipt"].includes(req.body.method) ? Infinity : CACHE_MAX_AGE*1000;
         const cachedResponse = getResponseFromCache(cacheKey, cacheMaxAgeMs, req.body.id);
         if (cachedResponse) {
             console.log(`RPC cached response: ${JSON.stringify(cachedResponse)}`);
@@ -162,7 +184,10 @@ async function handleHttpConnection(rpcUrl) {
                 res.send(rpcRes.data);
                 
                 // cache some of them
-                if (["eth_chainId", "eth_blockNumber", "net_version", "eth_getTransactionReceipt"].includes(req.body.method)) {
+                if (
+                    ["eth_chainId", "eth_blockNumber", "net_version", "eth_getTransactionReceipt"].includes(req.body.method) ||
+                    (req.body.method === "eth_call" && req.body.params.some(param => 'blockHash' in param)) // eth_call is immutable if referring to a specific block
+                ) {
                     writeResponseToCache(cacheKey, rpcRes.data.result);
                 }
             } catch(err) {

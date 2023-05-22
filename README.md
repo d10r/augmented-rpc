@@ -6,11 +6,12 @@ It also applies a few simple caching strategies. More details below.
 
 To use it, first install dependencies with `npm i`, then run with:
 ```
-RPC=<http-url|ws-url> [PORT=<port>] node app.js
+RPC=<http-url|ws-url> [PORT=<port>] [DB_FILE=path/to/sqlite/file] node app.js
 ```
  
 If an http url is given, an http server is started.
 If a websocket url is given, a websocket server is started.
+If DB_FILE is specified, a persistent cache is created.
  
 The following additional functionality is implemented for http upstreams:
 * Responses are cached. For requests with immutable response (e.g. eth_chainId), it always serves the cached response.  

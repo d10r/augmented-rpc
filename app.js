@@ -72,12 +72,24 @@ function getCacheKey(req) {
     return `${req.body.method}${JSON.stringify(req.body.params)}`;
 }
 
+function getFromDb(key) {
+    return new Promise((resolve, reject) => {
+        db.get(`SELECT val FROM data WHERE key = ?`, [key], (err, row) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(row);
+            }
+        });
+    });
+}
+
 // returns the response to send from cache or undefined if not cached.
 // Reasons for undefined response: unsupported method, not yet set, outdated
 // param key: cache key
 // param maxAgeMs: maximum age the cached entry may have to be considered. Can be `Infinity`
 // param reqId: json-rpc id. Is just passed through
-function getResponseFromCache(key, maxAgeMs, reqId) {
+async function getResponseFromCache(key, maxAgeMs, reqId) {
     let val;
     if (cache.has(key)) { // try from cache
         if (Date.now() - cache.get(key).ts <= maxAgeMs) {
@@ -88,24 +100,27 @@ function getResponseFromCache(key, maxAgeMs, reqId) {
             console.debug(`cached entry skipped, too old (> ${maxAgeMs} ms)`);
         }
     } else if (db !== undefined) { // try from DB
-        db.get(`SELECT val FROM data WHERE key = ?`, [key], function(err, row) {
-            if (err) console.error(`DB read error: ${err.message}`);
+        try {
+            const row = await getFromDb(key);
             // If the key doesn't exist, row will be undefined
             if (row) {
-                console.log(`DB: Retrieved key ${key}, value ${row.val}`);
+                //console.log(`DB: req ${reqId} retrieved key ${key}, value ${row.val}`);
                 // We expect the stored value to be a JSON string, so parse it before returning.
-                val = row.val;
+                val = JSON.parse(row.val);
             }
-        });
+        } catch (err) {
+            console.error(`DB read error: ${err.message}`);
+        }
     }
 
-    return val === undefined ?
-        undefined :
-        {
+    // receipts may have been null previously, in that case ignore the cached value
+    if (val !== undefined && val !== null) {
+        return {
             jsonrpc: "2.0",
             id: reqId,
-            result: cache.get(key).val
+            result: val
         };
+    }
 }
 
 function writeResponseToCache(key, val) {
@@ -150,7 +165,7 @@ async function handleHttpConnection(rpcUrl) {
     app.get("/printstats", printStats);
     
     app.post("/", async (req, res) => {
-        console.log(`RPC request at ${Date.now()/1000}: ${JSON.stringify(req.body)}`);
+        console.log(`#${req.body.id} RPC request at ${Date.now()/1000}: ${JSON.stringify(req.body)}`);
         //const data = {"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1};
         
         // check if duplicate - throttle if so in order to give the cache a chance to already be filled
@@ -168,16 +183,16 @@ async function handleHttpConnection(rpcUrl) {
         
         // Check if we can reuse a cached response
         const cacheMaxAgeMs = ["eth_chainId", "net_version", "eth_getTransactionReceipt"].includes(req.body.method) ? Infinity : CACHE_MAX_AGE*1000;
-        const cachedResponse = getResponseFromCache(cacheKey, cacheMaxAgeMs, req.body.id);
+        const cachedResponse = await getResponseFromCache(cacheKey, cacheMaxAgeMs, req.body.id);
         if (cachedResponse) {
-            console.log(`RPC cached response: ${JSON.stringify(cachedResponse)}`);
+            console.log(`#${req.body.id} Cached response for ${req.body.method}: ${JSON.stringify(cachedResponse)}`);
             res.send(cachedResponse);
             httpCacheResCnt++;
         } else {
             // ... forward request to upstream
             try {
                 const rpcRes = await upstreamHttpRequest(rpc, req.body);
-                console.log(`RPC response: ${JSON.stringify(rpcRes.data)}`);
+                console.log(`#${req.body.id} Upstream response for ${req.body.method}: ${JSON.stringify(rpcRes.data)}`);
                 httpUpstreamResCnt++;
                 
                 // send response to the client
@@ -185,8 +200,8 @@ async function handleHttpConnection(rpcUrl) {
                 
                 // cache some of them
                 if (
-                    ["eth_chainId", "eth_blockNumber", "net_version", "eth_getTransactionReceipt"].includes(req.body.method) ||
-                    (req.body.method === "eth_call" && req.body.params.some(param => 'blockHash' in param)) // eth_call is immutable if referring to a specific block
+                    ["eth_chainId", "eth_blockNumber", "net_version"].includes(req.body.method) ||
+                    (req.body.method === "eth_call" && req.body.params.some(param => typeof param === 'object' && 'blockHash' in param)) // eth_call is immutable if referring to a specific block
                 ) {
                     writeResponseToCache(cacheKey, rpcRes.data.result);
                 }

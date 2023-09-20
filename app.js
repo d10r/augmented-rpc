@@ -104,9 +104,13 @@ async function getResponseFromCache(key, maxAgeMs, reqId) {
             const row = await getFromDb(key);
             // If the key doesn't exist, row will be undefined
             if (row) {
-                //console.log(`DB: req ${reqId} retrieved key ${key}, value ${row.val}`);
-                // We expect the stored value to be a JSON string, so parse it before returning.
-                val = JSON.parse(row.val);
+                if (Date.now() - cache.get(key).ts <= maxAgeMs) {
+                    //console.log(`DB: req ${reqId} retrieved key ${key}, value ${row.val}`);
+                    // We expect the stored value to be a JSON string, so parse it before returning.
+                    val = JSON.parse(row.val);
+                } else {
+                    console.debug(`DB entry skipped, too old (> ${maxAgeMs} ms)`);
+                }
             }
         } catch (err) {
             console.error(`DB read error: ${err.message}`);

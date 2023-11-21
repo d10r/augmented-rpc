@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
@@ -20,6 +22,9 @@ const db = process.env.DB_FILE !== undefined ?
 
 const port = process.env.PORT || 3000;
 const rpc = process.env.RPC;
+const rpc2 = process.env.RPC2;
+
+// TODO: check that both rpc upstreams point to the same chain
 
 let app; // http
 let client; // ws
@@ -30,9 +35,9 @@ let socket; // socket.io
     console.log("init");
     const rpcUrl = new URL(rpc);
     if(rpcUrl.protocol === "ws:" || rpcUrl.protocol === "wss:") {
-        handleWsConnection(rpcUrl);
+        handleWsConnection(rpc);
     } else {
-        handleHttpConnection(rpcUrl);
+        handleHttpConnection(rpc, rpc2);
     }
 })()
 
@@ -158,7 +163,8 @@ const DUPLICATE_DELAY_TRIGGER_THRESHOLD_MS=1000;
 const DUPLICATE_MIN_DELAY_MS=500;
 const DUPLICATE_RANDOM_MAX_EXTRA_DELAY_MS=1000;
 const CACHE_MAX_AGE = process.env.CACHE_MAX_AGE || 10;
-async function handleHttpConnection(rpcUrl) {
+
+async function handleHttpConnection(upstreamRpc, upstreamRpc2) {
     app = express();
     app.use(bodyParser.json());
 
@@ -186,7 +192,7 @@ async function handleHttpConnection(rpcUrl) {
         duplicateDetector.set(cacheKey, Date.now());
         
         // Check if we can reuse a cached response
-        const cacheMaxAgeMs = ["eth_chainId", "net_version", "eth_getTransactionReceipt"].includes(req.body.method) ? Infinity : CACHE_MAX_AGE*1000;
+        const cacheMaxAgeMs = ["eth_chainId", "net_version", "eth_getTransactionReceipt", "eth_getStorageAt"].includes(req.body.method) ? Infinity : CACHE_MAX_AGE*1000;
         const cachedResponse = await getResponseFromCache(cacheKey, cacheMaxAgeMs, req.body.id);
         if (cachedResponse) {
             console.log(`#${req.body.id} Cached response for ${req.body.method}: ${JSON.stringify(cachedResponse)}`);
@@ -195,7 +201,7 @@ async function handleHttpConnection(rpcUrl) {
         } else {
             // ... forward request to upstream
             try {
-                const rpcRes = await upstreamHttpRequest(rpc, req.body);
+                const rpcRes = await upstreamHttpRequest(upstreamRpc, upstreamRpc2, req.body);
                 console.log(`#${req.body.id} Upstream response for ${req.body.method}: ${JSON.stringify(rpcRes.data)}`);
                 httpUpstreamResCnt++;
                 
@@ -218,15 +224,34 @@ async function handleHttpConnection(rpcUrl) {
     });
 }
 
+async function shouldRetryWithFallbackRpc(reqBody, respData) {
+    // always: 
+    // * non-200 http code
+    // * return obj contains error element (instead of result element)
+    // * eth_getTransactionReceipt: result is null
+    if (reqBody.method === "eth_getTransactionReceipt" && respData.result == null) {
+        console.log("null response, should fallback");
+        return true;
+    }
+    return false;
+}
+
 // param rpc: url of the upstream http rpc
+// param fallbackRpc: url of the fallback upstream http rpc
 // param reqBody: body of the POST request
 // returns the response data
 // throws on permanent failure (after exhausting all retries)
 // if the request fails, it retries with exponential backoff
-async function upstreamHttpRequest(rpc, reqBody, nrRetries = 10, initialTimeoutMs = 2000) {
+async function upstreamHttpRequest(rpc, fallbackRpc, reqBody, nrRetries = 10, initialTimeoutMs = 2000) {
     try {
-        return await axios.post(rpc, reqBody);
+        const response = await axios.post(rpc, reqBody);
+        if (fallbackRpc && rpc !== fallbackRpc && shouldRetryWithFallbackRpc(reqBody, JSON.stringify(response.data))) {
+            return upstreamHttpRequest(fallbackRpc, fallbackRpc, reqBody, nrRetries-1, initialTimeoutMs*2);
+        } else {
+            return response;
+        }
     } catch(err) {
+        console.log("err: ", err);
         console.debug(`upstream retry - #${nrRetries} attempts left, next timeout: ${initialTimeoutMs} ms`);
         let forwardedErr = "unspecified";
         if(err.response) {
@@ -242,7 +267,8 @@ async function upstreamHttpRequest(rpc, reqBody, nrRetries = 10, initialTimeoutM
         // retry loop implemented via recursion. Double timeout for exponential backoff
         if (nrRetries > 0) {
             await new Promise(resolve => setTimeout(resolve, initialTimeoutMs));
-            return upstreamHttpRequest(rpc, reqBody, nrRetries-1, initialTimeoutMs*2)
+            // use the fallback rpc for the last 2 attempts
+            return upstreamHttpRequest(nrRetries <= 2 ? fallbackRpc : rpc, fallbackRpc, reqBody, nrRetries-1, initialTimeoutMs*2)
         } else {
             throw Error(forwardErr) // if giving up, hand over the last error
         }
@@ -253,12 +279,12 @@ async function upstreamHttpRequest(rpc, reqBody, nrRetries = 10, initialTimeoutM
 // Websocket 
 // ********************************************************
 
-function handleWsConnection(rpcUrl) {
+function handleWsConnection(upstreamRpc) {
     console.log("opening websocket connection...");
 
     const WS = require("ws");
     server = new WS.WebSocketServer({port: port});
-    client = new WS(rpc);
+    client = new WS(upstreamRpc);
     
     let connCnt = 0;
     
